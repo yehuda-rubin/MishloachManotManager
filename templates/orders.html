@@ -1,43 +1,47 @@
 {% extends 'base.html' %}
 {% block content %}
-<h2>ניהול וקליטת תושבים</h2>
-<div class="card p-3 mb-4">
-    <h4>טעינת קובץ תושבים (Excel/CSV)</h4>
-    <p>תומך בכותרות בעברית: שם משפחה, שם פרטי, רחוב, מספר בית, טלפון וכו'.</p>
-    <form method="post" enctype="multipart/form-data">
-        <div class="mb-3">
-            <input class="form-control" type="file" name="file" required accept=".csv, .xlsx">
+<h2>ניהול הזמנות חיצוניות</h2>
+
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card p-3">
+            <h4>1. טעינת קובץ הזמנות</h4>
+            <form method="post" enctype="multipart/form-data">
+                <input type="hidden" name="action" value="upload">
+                <div class="mb-3">
+                    <label>קובץ (sender_code, invitees, package_size)</label>
+                    <input class="form-control" type="file" name="file" required>
+                </div>
+                <button type="submit" class="btn btn-warning">טען</button>
+            </form>
         </div>
-        <button type="submit" class="btn btn-primary">טען ועבד נתונים</button>
-    </form>
+    </div>
+    <div class="col-md-6">
+        <div class="card p-3">
+            <h4>2. הפצה</h4>
+            <p>צור הזמנות במערכת מהרשימה שטענת.</p>
+            <form method="post">
+                <input type="hidden" name="action" value="distribute">
+                <button type="submit" class="btn btn-success w-100">הרץ הפצה</button>
+            </form>
+        </div>
+    </div>
 </div>
 
-<div class="row">
-    <div class="col-md-6">
-        <h5>רחובות חסרים (Missing Streets Log)</h5>
-        <table class="table table-sm table-bordered">
-            <thead><tr><th>רחוב</th><th>תאריך</th></tr></thead>
-            <tbody>
-                {% for row in missing_streets %}
-                <tr><td>{{ row['streetname'] }}</td><td>{{ row['found_at'] }}</td></tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-    <div class="col-md-6">
-        <h5>לוג עיבוד תושבים אחרון</h5>
-        <table class="table table-sm table-striped">
-            <thead><tr><th>סטטוס</th><th>הערה</th><th>שם</th></tr></thead>
-            <tbody>
-                {% for row in archive_log %}
-                <tr>
-                    <td>{{ row['status'] }}</td>
-                    <td>{{ row['status_note'] }}</td>
-                    <td>{{ row['lastname'] }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-</div>
+<h4>סטטוס הפצה</h4>
+<table class="table table-sm table-bordered">
+    <thead>
+        <tr><th>ID</th><th>שולח</th><th>מוזמנים</th><th>סטטוס</th></tr>
+    </thead>
+    <tbody>
+        {% for row in status_rows %}
+        <tr>
+            <td>{{ row['id'] }}</td>
+            <td>{{ row['sender_code'] }}</td>
+            <td>{{ row['invitees'] }}</td>
+            <td>{{ row['status'] }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
 {% endblock %}

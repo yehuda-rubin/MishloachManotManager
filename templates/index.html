@@ -23,4 +23,14 @@
         </div>
     </div>
 </div>
+
+<div class="mt-5 border-top pt-3">
+    <h4 class="text-danger">אזור סכנה - איפוס מערכת</h4>
+    <p>הכפתור הבא ימחק את כל המשפחות, ההזמנות והרחובות ויתחיל מאפס.</p>
+    <form action="/reset_db" method="post">
+        <button type="submit" class="btn btn-danger btn-lg" onclick="return confirm('האם אתה בטוח שברצונך למחוק את כל הנתונים במערכת? פעולה זו אינה הפיכה!')">
+            ⚠️ אפס את כל הנתונים והתחל מחדש
+        </button>
+    </form>
+</div>
 {% endblock %}
