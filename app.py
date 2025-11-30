@@ -1,13 +1,13 @@
 import os
 import psycopg2
 import pandas as pd
+import numpy as np
 from psycopg2.extras import RealDictCursor, execute_batch
 from flask import Flask, render_template, request, redirect, url_for, flash, Response
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_key_change_me'
 
-# הגדרת חיבור למסד הנתונים
 DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@db:5432/mishloach_db")
 
 def get_db_connection():
@@ -19,38 +19,90 @@ def get_db_connection():
         print(f"DB Connection Error: {e}")
         return None
 
+# --- פונקציות עזר לניקוי נתונים ---
+def clean_int_str(val):
+    """מנקה מספרים מייצוג עשרוני או טקסט למחרוזת של מספר שלם נקי"""
+    try:
+        if pd.isna(val) or val is None or str(val).strip() == '':
+            return None
+        # המרה לפלוט ואז לאינט כדי להעיף .0
+        return str(int(float(str(val).strip())))
+    except:
+        return str(val).strip() # אם זה לא מספר, מחזיר את הטקסט כמו שהוא
+
+def safe_int(val):
+    """מנסה להמיר למספר שלם, מחזיר 0 אם נכשל"""
+    try:
+        if pd.isna(val): return 0
+        return int(float(str(val).strip()))
+    except:
+        return 0
+
+def extract_clean_data(df):
+    """בונה טבלה נקייה מתושבים ללא כפילויות"""
+    clean_rows = []
+    # המרת שמות עמודות לאותיות קטנות
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    
+    # מיפוי שדות
+    field_options = {
+        'code': ['code', 'order_code', 'קוד', 'קוד מזמין'],
+        'lastname': ['lastname', 'last_name', 'משפחה', 'שם משפחה'],
+        'father_name': ['father_name', 'father_first_name', 'שם אבא', 'שם פרטי', 'פרטי'],
+        'mother_name': ['mother_name', 'mother_first_name', 'שם אמא', 'שם האשה', 'אשה'],
+        'streetname': ['streetname', 'street', 'רחוב', 'כתובת'],
+        'buildingnumber': ['buildingnumber', 'building_number', 'בנין', 'מס בית', 'מספר בית'],
+        'entrance': ['entrance', 'כניסה'],
+        'apartmentnumber': ['apartmentnumber', 'apartment_number', 'דירה', 'מספר דירה'],
+        'phone': ['phone', 'home_phone', 'טלפון', 'טלפון בבית'],
+        'mobile': ['mobile', 'נייד', 'נייד 1', 'סלולרי'],
+        'mobile2': ['mobile2', 'נייד 2', 'נייד אשה', 'סלולרי 2'],
+        'email': ['email', 'מייל', 'אימייל', 'דואר אלקטרוני'],
+        'standing_order': ['standing_order', 'הוראת קבע']
+    }
+
+    for _, row in df.iterrows():
+        new_row = {}
+        for field, options in field_options.items():
+            value = None
+            for opt in options:
+                if opt in df.columns:
+                    val = row[opt]
+                    if isinstance(val, pd.Series): val = val.iloc[0]
+                    if pd.notnull(val) and str(val).strip() != '':
+                        value = val
+                        break
+            new_row[field] = value
+        
+        # ניקוי וטיוב נתונים קריטי
+        new_row['code'] = safe_int(new_row['code']) if new_row['code'] else None
+        new_row['standing_order'] = safe_int(new_row['standing_order'])
+        
+        # המרה למחרוזות
+        for k in ['lastname', 'father_name', 'mother_name', 'streetname', 'buildingnumber', 
+                  'entrance', 'apartmentnumber', 'phone', 'mobile', 'mobile2', 'email']:
+            new_row[k] = str(new_row[k]) if new_row[k] is not None else ''
+                
+        clean_rows.append(new_row)
+        
+    return clean_rows
+
 # --- פונקציה לתיקון אוטומטי של המסד ---
 def auto_fix_database(cur):
-    """
-    פונקציה זו רצה בכל טעינה.
-    היא מוודאת שהטבלאות תקינות, מסירה אילוצים בעייתיים, מעדכנת פונקציות ומסנכרנת מונים.
-    """
     try:
-        # 1. הסרת האינדקס הייחודי המגביל (כתובת+טלפון)
         cur.execute("DROP INDEX IF EXISTS public.ux_person_unique_phone_address;")
-
-        # 2. הוספת עמודות חסרות לטבלאות זמניות
         cur.execute("ALTER TABLE public.temp_residents_csv ADD COLUMN IF NOT EXISTS code integer;")
         cur.execute("ALTER TABLE public.outerapporder ADD COLUMN IF NOT EXISTS sender_phone text;")
-
-        # 3. יצירת רחוב 999 לגיבוי
         cur.execute("INSERT INTO public.street (streetcode, streetname) VALUES (999, 'רחוב כללי') ON CONFLICT (streetcode) DO NOTHING;")
 
-        # 4. עדכון פונקציית העברת הנתונים
         cur.execute(r"""
         CREATE OR REPLACE FUNCTION "public"."raw_to_temp_stage"() RETURNS "void" LANGUAGE "plpgsql" AS $func$
         BEGIN
           TRUNCATE TABLE public.temp_residents_csv RESTART IDENTITY;
-          
           INSERT INTO public.street (streetname)
-          SELECT DISTINCT TRIM(r.streetname)
-          FROM public.raw_residents_csv r
-          WHERE TRIM(r.streetname) IS NOT NULL 
-            AND TRIM(r.streetname) <> ''
-            AND NOT EXISTS (
-                SELECT 1 FROM public.street s 
-                WHERE TRIM(s.streetname) = TRIM(r.streetname)
-            );
+          SELECT DISTINCT TRIM(r.streetname) FROM public.raw_residents_csv r
+          WHERE TRIM(r.streetname) IS NOT NULL AND TRIM(r.streetname) <> ''
+            AND NOT EXISTS (SELECT 1 FROM public.street s WHERE TRIM(s.streetname) = TRIM(r.streetname));
 
           INSERT INTO public.temp_residents_csv (
               code, lastname, father_name, mother_name, streetname, streetcode,
@@ -69,7 +121,6 @@ def auto_fix_database(cur):
         $func$;
         """)
 
-        # 5. עדכון פונקציית העיבוד - כולל התיקון הקריטי למונה (Sequence)
         cur.execute(r"""
         CREATE OR REPLACE FUNCTION "public"."process_residents_csv"() RETURNS "void" LANGUAGE "plpgsql" AS $func$
         DECLARE
@@ -77,23 +128,22 @@ def auto_fix_database(cur):
             existing_person INT;
             target_id INT;
         BEGIN
+            PERFORM setval('public.person_personid_seq', (SELECT COALESCE(MAX(personid), 0) + 1 FROM public.person), false);
+
             FOR rec IN SELECT * FROM temp_residents_csv LOOP
                 target_id := rec.code;
                 existing_person := NULL;
 
-                -- זיהוי לפי ID
                 IF target_id IS NOT NULL THEN
                     SELECT personid INTO existing_person FROM person WHERE personid = target_id;
                 END IF;
 
-                -- זיהוי לפי טלפון
                 IF existing_person IS NULL THEN
                     SELECT personid INTO existing_person FROM person 
                     WHERE format_il_phone(phone) = format_il_phone(rec.phone) LIMIT 1;
                 END IF;
 
                 IF existing_person IS NOT NULL THEN
-                    -- עדכון
                     UPDATE person SET 
                         lastname = COALESCE(rec.lastname, lastname),
                         email = COALESCE(rec.email, email),
@@ -102,23 +152,16 @@ def auto_fix_database(cur):
                     WHERE personid = existing_person;
                     UPDATE temp_residents_csv SET status = 'עודכן' WHERE temp_id = rec.temp_id;
                 ELSE
-                    -- הכנסה חדשה
                     IF target_id IS NOT NULL THEN
-                        -- הכנסה ידנית עם ID
                         INSERT INTO person(
                             personid, lastname, father_name, mother_name, streetcode, buildingnumber, entrance, apartmentnumber, phone, mobile, mobile2, email, standing_order
                         ) VALUES (
                             target_id, rec.lastname, rec.father_name, rec.mother_name, rec.streetcode, rec.buildingnumber, rec.entrance, rec.apartmentnumber, rec.phone, rec.mobile, rec.mobile2, rec.email, rec.standing_order
                         ) 
                         ON CONFLICT (personid) DO UPDATE SET lastname = EXCLUDED.lastname;
-                        
-                        -- תיקון קריטי: עדכון המונה מיד אחרי שימוש ידני במספר
-                        PERFORM setval(pg_get_serial_sequence('public.person', 'personid'), GREATEST(target_id, (SELECT last_value FROM public.person_personid_seq)));
+                        PERFORM setval('public.person_personid_seq', (SELECT COALESCE(MAX(personid), 0) + 1 FROM public.person), false);
                     ELSE
-                        -- הכנסה אוטומטית
-                        -- תיקון קריטי 2: וודא שהמונה מסונכרן עם המקסימום לפני בקשת מספר חדש
-                        PERFORM setval(pg_get_serial_sequence('public.person', 'personid'), (SELECT COALESCE(MAX(personid), 0) FROM public.person));
-                        
+                        PERFORM setval('public.person_personid_seq', (SELECT COALESCE(MAX(personid), 0) + 1 FROM public.person), false);
                         INSERT INTO person(
                             lastname, father_name, mother_name, streetcode, buildingnumber, entrance, apartmentnumber, phone, mobile, mobile2, email, standing_order
                         ) VALUES (
@@ -131,7 +174,6 @@ def auto_fix_database(cur):
         END;
         $func$;
         """)
-        
     except Exception as e:
         print(f"Auto-fix warning: {e}")
 
@@ -140,39 +182,30 @@ def index():
     conn = get_db_connection()
     if not conn: return "DB Error", 500
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
     auto_fix_database(cur)
-    
     cur.execute("SELECT COUNT(*) as count FROM person")
-    total_families = cur.fetchone()['count']
+    families = cur.fetchone()['count']
     cur.execute('SELECT COUNT(*) as count FROM "Order"')
-    total_orders = cur.fetchone()['count']
+    orders = cur.fetchone()['count']
     cur.execute("SELECT COUNT(*) as count FROM outerapporder WHERE status='waiting'")
-    pending_external = cur.fetchone()['count']
+    pending = cur.fetchone()['count']
     cur.close()
     conn.close()
-    return render_template('index.html', families=total_families, orders=total_orders, pending=pending_external)
+    return render_template('index.html', families=families, orders=orders, pending=pending)
 
 @app.route('/reset_db', methods=['POST'])
 def reset_db():
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # ניקוי מלא
         cur.execute('TRUNCATE TABLE "payment_ledger", "Order", "outerapporder", "person_archive", "raw_residents_csv", "temp_residents_csv" CASCADE;')
         cur.execute('DELETE FROM "person";')
-        
-        # איפוס מונים
         cur.execute("ALTER SEQUENCE public.person_personid_seq RESTART WITH 1;")
         cur.execute("ALTER SEQUENCE public.order_id_seq RESTART WITH 1;")
-        
-        # החזרת נתוני בסיס
         cur.execute("INSERT INTO public.street (streetcode, streetname) VALUES (999, 'רחוב כללי') ON CONFLICT (streetcode) DO NOTHING;")
-        
-        flash('המערכת אופסה בהצלחה! כל הנתונים נמחקו.', 'success')
+        flash('המערכת אופסה בהצלחה!', 'success')
     except Exception as e:
-        flash(f'שגיאה באיפוס: {e}', 'danger')
-    
+        flash(f'שגיאה: {e}', 'danger')
     conn.close()
     return redirect(url_for('index'))
 
@@ -180,7 +213,6 @@ def reset_db():
 def residents():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-
     auto_fix_database(cur)
 
     if request.method == 'POST':
@@ -191,28 +223,25 @@ def residents():
                 filename = file.filename.lower()
                 
                 if filename.endswith('.xlsx'):
-                    try:
-                        file.seek(0)
-                        df = pd.read_excel(file, engine='openpyxl', header=None)
+                    try: df = pd.read_excel(file, engine='openpyxl', header=None)
                     except: pass
                 
                 if df is None:
-                    encodings = ['cp1255', 'utf-8', 'windows-1252']
+                    encodings = ['utf-8', 'cp1255', 'windows-1252']
                     for enc in encodings:
                         try:
                             file.seek(0)
                             df = pd.read_csv(file, encoding=enc, header=None)
-                            break
+                            if df.shape[1] > 1: break
                         except: continue
                 
                 if df is None:
                     flash('לא ניתן לקרוא את הקובץ.', 'danger')
                 else:
-                    # מציאת כותרת
                     header_index = -1
                     for i, row in df.head(20).iterrows():
-                        row_text = " ".join([str(val) for val in row.values])
-                        if 'משפחה' in row_text or 'last_name' in row_text or 'lastname' in row_text or 'order_code' in row_text:
+                        row_text = " ".join([str(val) for val in row.values]).lower()
+                        if 'lastname' in row_text or 'last_name' in row_text or 'משפחה' in row_text or 'code' in row_text:
                             header_index = i
                             break
                     
@@ -223,57 +252,16 @@ def residents():
                         df.columns = df.iloc[0]
                         df = df[1:].reset_index(drop=True)
 
-                    df.columns = [str(c).strip() for c in df.columns]
-                    
-                    column_mapping = {
-                        # CODES.xlsx
-                        'משפחה': 'lastname', 'שם אבא': 'father_name', 'שם אמא': 'mother_name',
-                        'בנין': 'buildingnumber', 'נייד 1': 'mobile', 'הוראת קבע': 'standing_order',
-                        
-                        # 5785_3.xlsx / 5785_5.csv
-                        'last_name': 'lastname', 'father_first_name': 'father_name', 'mother_first_name': 'mother_name',
-                        'street': 'streetname', 'building_number': 'buildingnumber', 'apartment_number': 'apartmentnumber',
-                        'home_phone': 'phone', 'mobile': 'mobile', 'order_code': 'code',
-                        
-                        # עברית כללי
-                        'שם משפחה': 'lastname', 'רחוב': 'streetname', 'כתובת': 'streetname',
-                        'מס בית': 'buildingnumber', 'מספר בית': 'buildingnumber',
-                        'טלפון': 'phone', 'נייד': 'mobile', 'נייד 2': 'mobile2',
-                        'קוד': 'code', 'דירה': 'apartmentnumber'
-                    }
-                    df.rename(columns=column_mapping, inplace=True)
-                    
-                    required = ['code', 'lastname', 'father_name', 'mother_name', 'streetname', 'buildingnumber', 'entrance', 'apartmentnumber', 'phone', 'mobile', 'mobile2', 'email', 'standing_order']
-                    for col in required:
-                        if col not in df.columns: df[col] = None
-                    df = df.where(pd.notnull(df), None)
+                    clean_data = extract_clean_data(df)
 
                     cur.execute("TRUNCATE TABLE raw_residents_csv RESTART IDENTITY")
                     data_values = []
-                    for _, row in df.iterrows():
-                        so_val = 0
-                        try:
-                            if row['standing_order']: so_val = int(float(str(row['standing_order'])))
-                        except: so_val = 0
-                        
-                        code_val = str(row['code']) if row['code'] else None
-
-                        val = (
-                            code_val,
-                            str(row['lastname']) if row['lastname'] else '',
-                            str(row['father_name']) if row['father_name'] else '',
-                            str(row['mother_name']) if row['mother_name'] else '',
-                            str(row['streetname']) if row['streetname'] else '',
-                            str(row['buildingnumber']) if row['buildingnumber'] else '',
-                            str(row['entrance']) if row['entrance'] else '',
-                            str(row['apartmentnumber']) if row['apartmentnumber'] else '',
-                            str(row['phone']) if row['phone'] else '',
-                            str(row['mobile']) if row['mobile'] else '',
-                            str(row['mobile2']) if row['mobile2'] else '',
-                            str(row['email']) if row['email'] else '',
-                            so_val
-                        )
-                        data_values.append(val)
+                    for row in clean_data:
+                        data_values.append((
+                            row['code'], row['lastname'], row['father_name'], row['mother_name'],
+                            row['streetname'], row['buildingnumber'], row['entrance'], row['apartmentnumber'],
+                            row['phone'], row['mobile'], row['mobile2'], row['email'], row['standing_order']
+                        ))
 
                     insert_query = """
                     INSERT INTO raw_residents_csv 
@@ -281,11 +269,10 @@ def residents():
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """
                     execute_batch(cur, insert_query, data_values)
-                    
                     cur.execute("SELECT raw_to_temp_stage()")
                     cur.execute("SELECT process_residents_csv()")
                     
-                    flash(f'קובץ {filename} נקלט בהצלחה!', 'success')
+                    flash(f'קובץ {filename} נקלט בהצלחה! {len(data_values)} רשומות.', 'success')
             except Exception as e:
                 flash(f'שגיאה: {str(e)}', 'danger')
 
@@ -309,27 +296,29 @@ def orders():
                 try:
                     df = None
                     if file.filename.lower().endswith('.csv'):
-                        try: file.seek(0); df = pd.read_csv(file, encoding='cp1255')
-                        except: file.seek(0); df = pd.read_csv(file, encoding='utf-8')
+                        try: file.seek(0); df = pd.read_csv(file, encoding='utf-8')
+                        except: file.seek(0); df = pd.read_csv(file, encoding='cp1255')
                     else: file.seek(0); df = pd.read_excel(file, engine='openpyxl')
 
-                    df.columns = [str(c).strip() for c in df.columns]
+                    # נרמול עמודות הזמנות
+                    df.columns = [str(c).strip().lower() for c in df.columns]
                     data_values = []
-                    for _, row in df.iterrows():
-                        sender = ''
-                        for col in ['sender_code', 'order_code', 'code', 'קוד', 'קוד מזמין']:
-                            if col in df.columns and pd.notnull(row[col]): sender = str(row[col]); break
-                        
-                        invitees = ''
-                        for col in ['invitees', 'guest_list', 'מוזמנים', 'רשימה']:
-                            if col in df.columns and pd.notnull(row[col]): invitees = str(row[col]); break
+                    
+                    # חיפוש עמודות
+                    col_sender = next((c for c in df.columns if 'sender' in c or 'order_code' in c or 'code' in c or 'קוד' in c), None)
+                    col_invitees = next((c for c in df.columns if 'invite' in c or 'guest' in c or 'מוזמנים' in c), None)
+                    col_phone = next((c for c in df.columns if 'phone' in c or 'mobile' in c or 'טלפון' in c), None)
+                    col_pkg = next((c for c in df.columns if 'package' in c or 'גודל' in c), None)
 
-                        phone = None
-                        for col in ['mobile', 'phone', 'home_phone', 'נייד', 'טלפון', 'נייד 1']:
-                            if col in df.columns and pd.notnull(row[col]): phone = str(row[col]); break
+                    for _, row in df.iterrows():
+                        # === התיקון הקריטי: ניקוי ה-".0" מקוד השולח ===
+                        sender = clean_int_str(row[col_sender]) if col_sender else ''
+                        invitees = str(row[col_invitees]) if col_invitees and pd.notnull(row[col_invitees]) else ''
+                        phone = str(row[col_phone]) if col_phone and pd.notnull(row[col_phone]) else None
+                        pkg = str(row[col_pkg]) if col_pkg and pd.notnull(row[col_pkg]) else 'סמלי'
                         
-                        pkg = str(row.get('package_size', 'סמלי'))
-                        if sender or invitees: data_values.append((sender, invitees, pkg, 'upload', phone))
+                        if sender or invitees:
+                            data_values.append((sender, invitees, pkg, 'upload', phone))
 
                     insert_query = "INSERT INTO outerapporder (sender_code, invitees, package_size, origin, sender_phone) VALUES (%s, %s, %s, %s, %s)"
                     execute_batch(cur, insert_query, data_values)
